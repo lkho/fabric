@@ -25,6 +25,7 @@ import (
 	"github.com/hyperledger/fabric/common/tools/configtxlator/rest"
 	"github.com/op/go-logging"
 	"gopkg.in/alecthomas/kingpin.v2"
+	"github.com/hyperledger/fabric/common/tools/configtxlator/cli"
 )
 
 var logger = logging.MustGetLogger("configtxlator")
@@ -42,16 +43,21 @@ var (
 
 func main() {
 	kingpin.Version("0.0.1")
-	switch kingpin.MustParse(app.Parse(os.Args[1:])) {
+	cliProcessor := cli.NewCli(app)
+	cmd, err := app.Parse(os.Args[1:])
+	switch kingpin.MustParse(cmd, err) {
 	// "start" command
 	case start.FullCommand():
 		startServer(fmt.Sprintf("%s:%d", *hostname, *port))
 
-	// "version" command
+		// "version" command
 	case version.FullCommand():
 		printVersion()
-	}
 
+		// run other commands with cli
+	default:
+		cliProcessor.Run(cmd)
+	}
 }
 
 func startServer(address string) {

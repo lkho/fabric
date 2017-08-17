@@ -27,6 +27,13 @@ import (
 	cb "github.com/hyperledger/fabric/protos/common"
 
 	"github.com/golang/protobuf/proto"
+	"github.com/hyperledger/fabric/common/configtx"
+	"github.com/hyperledger/fabric/protos/utils"
+	"github.com/hyperledger/fabric/msp/mgmt"
+	"github.com/hyperledger/fabric/bccsp/factory"
+	"github.com/hyperledger/fabric/common/localmsp"
+	"github.com/hyperledger/fabric/common/crypto"
+	"github.com/hyperledger/fabric/common/util"
 )
 
 func fieldBytes(fieldName string, r *http.Request) ([]byte, error) {
@@ -122,4 +129,134 @@ func SanityCheckConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusOK)
 	w.Write(resBytes)
+}
+
+func signingConfigUpdateEnv(w http.ResponseWriter, r *http.Request, env *cb.ConfigUpdateEnvelope) ([]byte, error) {
+	mspID := r.FormValue("mspID")
+	mspDir := r.FormValue("mspDir")
+
+	var signer crypto.LocalSigner
+	if mspDir != "" {
+		mgmt.LoadLocalMsp(mspDir, factory.GetDefaultOpts(), mspID)
+		signer = localmsp.NewSigner()
+	} else {
+		signer = nil
+	}
+
+	if signer != nil {
+		sigHeader, err := signer.NewSignatureHeader()
+
+		if err != nil {
+			/*w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, "Bad signer :%s\n", err)*/
+			return nil, err
+		}
+
+		configSig := &cb.ConfigSignature{
+			SignatureHeader: utils.MarshalOrPanic(sigHeader),
+		}
+
+		configSig.Signature, err = signer.Sign(util.ConcatenateBytes(configSig.SignatureHeader, env.ConfigUpdate))
+		if err != nil {
+			/*w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, "Error signing config update: %s\n", err)*/
+			return nil, err
+		}
+
+		env.Signatures = append(env.Signatures, configSig)
+	}
+
+	return proto.Marshal(env)
+}
+
+func SignConfigUpdateEnvelope(w http.ResponseWriter, r *http.Request) {
+	env, err := fieldBytes("configUpdateEnvelope", r)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, "Bad Config Update Envelope: %s\n", err)
+		return
+	}
+
+	configUpdateEnvelope, err := configtx.UnmarshalConfigUpdateEnvelope(env)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "Error unmarshaling config update envelope: %s\n", err)
+		return
+	}
+
+	encoded, err := signingConfigUpdateEnv(w, r, configUpdateEnvelope)
+
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "Error marshaling config update envelope: %s\n", err)
+		return
+	}
+
+	channelID := r.FormValue("channelID")
+	payloadChannelHeader := utils.MakeChannelHeader(cb.HeaderType_CONFIG_UPDATE, 0, channelID, 0)
+	payloadHeader := &cb.Header{}
+	payloadHeader.ChannelHeader = utils.MarshalOrPanic(payloadChannelHeader)
+
+	payloadBytes := utils.MarshalOrPanic(&cb.Payload{
+		Header: payloadHeader,
+		Data:   encoded,
+	})
+
+	envelope := &cb.Envelope{
+		Payload: payloadBytes,
+	}
+
+	encoded = utils.MarshalOrPanic(envelope)
+
+	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Write(encoded)
+}
+
+func SignConfigUpdate(w http.ResponseWriter, r *http.Request) {
+	updateConfig, err := fieldBytes("configUpdate", r)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, "Bad Config Update: %s\n", err)
+		return
+	}
+
+	configUpdate, err := configtx.UnmarshalConfigUpdate(updateConfig)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "Error unmarshaling config update: %s\n", err)
+		return
+	}
+
+	configUpdateEnvelope := &cb.ConfigUpdateEnvelope{
+		ConfigUpdate: utils.MarshalOrPanic(configUpdate),
+	}
+
+	encoded, err := signingConfigUpdateEnv(w, r, configUpdateEnvelope)
+
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "Error marshaling config update envelope: %s\n", err)
+		return
+	}
+
+	channelID := r.FormValue("channelID")
+	payloadChannelHeader := utils.MakeChannelHeader(cb.HeaderType_CONFIG_UPDATE, 0, channelID, 0)
+	payloadHeader := &cb.Header{}
+	payloadHeader.ChannelHeader = utils.MarshalOrPanic(payloadChannelHeader)
+
+	payloadBytes := utils.MarshalOrPanic(&cb.Payload{
+		Header: payloadHeader,
+		Data:   encoded,
+	})
+
+	envelope := &cb.Envelope{
+		Payload: payloadBytes,
+	}
+
+	encoded = utils.MarshalOrPanic(envelope)
+
+	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Write(encoded)
 }

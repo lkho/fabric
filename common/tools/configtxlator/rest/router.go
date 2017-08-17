@@ -22,19 +22,13 @@ import (
 
 func NewRouter() *mux.Router {
 	router := mux.NewRouter().StrictSlash(true)
-	router.
-		HandleFunc("/protolator/encode/{msgName}", Encode).
-		Methods("POST")
+	router.HandleFunc("/protolator/encode/{msgName}", Encode).Methods("POST")
 
-	router.
-		HandleFunc("/protolator/decode/{msgName}", Decode).
-		Methods("POST")
-	router.
-		HandleFunc("/configtxlator/compute/update-from-configs", ComputeUpdateFromConfigs).
-		Methods("POST")
-	router.
-		HandleFunc("/configtxlator/config/verify", SanityCheckConfig).
-		Methods("POST")
+	router.HandleFunc("/protolator/decode/{msgName}", Decode).Methods("POST")
+	router.HandleFunc("/configtxlator/compute/update-from-configs", ComputeUpdateFromConfigs).Methods("POST")
+	router.HandleFunc("/configtxlator/config/verify", SanityCheckConfig).Methods("POST")
+	router.HandleFunc("/configtxlator/sign-update-config", SignConfigUpdate).Methods("POST")
+	router.HandleFunc("/configtxlator/sign-update-config-envelope", SignConfigUpdateEnvelope).Methods("POST")
 
 	return router
 }
