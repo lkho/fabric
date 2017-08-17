@@ -38,6 +38,7 @@ type Cli struct {
 	updateIn2     **os.File
 	updateIn2Json *bool
 	updateChannel *string
+	updateEnv     *bool
 	updateOut     *string
 	updateOutJson *bool
 
@@ -73,6 +74,7 @@ func NewCli(app *kingpin.Application) (cli *Cli) {
 	cli.updateIn2 = cli.updateCmd.Flag("updated", "updated Config").Short('2').File()
 	cli.updateIn2Json = cli.updateCmd.Flag("2j", "use json format instead of protobuf").Bool()
 	cli.updateChannel = cli.updateCmd.Flag("channel", "Channel ID").Required().Short('c').String()
+	cli.updateEnv = cli.updateCmd.Flag("envelope", "output ConfigUpdate wrapped in Envelope").Short('e').Bool()
 	cli.updateOut = cli.updateCmd.Flag("out", "output ConfigUpdate file. Write to STDOUT if not specified.").Short('o').String()
 	cli.updateOutJson = cli.updateCmd.Flag("oj", "use json format instead of protobuf").Bool()
 
@@ -81,8 +83,8 @@ func NewCli(app *kingpin.Application) (cli *Cli) {
 	cli.verifyInJson = cli.verifyCmd.Flag("ij", "use json format instead of protobuf").Bool()
 	cli.verifyOut = cli.verifyCmd.Flag("out", "output json file. Write to STDOUT if not specified.").Short('o').String()
 
-	cli.signCmd = app.Command("sign-config-update", "sign a ConfigUpdate and output an Envelope").Alias("sc")
-	cli.signIn = cli.signCmd.Flag("in", "input ConfigUpdate file. Read from STDIN if not specified.").Short('i').File()
+	cli.signCmd = app.Command("sign-config-update", "sign a ConfigUpdate Envelope. Signatures will be appended").Alias("sc")
+	cli.signIn = cli.signCmd.Flag("in", "input Envelope file. Read from STDIN if not specified.").Short('i').File()
 	cli.signInJson = cli.signCmd.Flag("ij", "use json format instead of protobuf").Bool()
 	cli.signChannel = cli.signCmd.Flag("channel", "Channel ID").Required().Short('c').String()
 	cli.signMspId = cli.signCmd.Flag("mspid", "MSP ID used to sign").Required().String()
@@ -127,6 +129,7 @@ func (cli *Cli) Run(command string) {
 			Input{Stdin: false, File: *cli.updateIn1, Json: *cli.updateIn1Json},
 			Input{Stdin: false, File: *cli.updateIn2, Json: *cli.updateIn2Json},
 			*cli.updateChannel,
+			*cli.updateEnv,
 			Output{Stdout: true, File: cli.updateOut, Json: *cli.updateOutJson})
 
 	case cli.verifyCmd.FullCommand():
@@ -245,23 +248,6 @@ func (cli *Cli) Encode(msgName string, input Input, output Output) {
 	cli.FatalIfError(err, "Error sending output")
 }
 
-func (cli *Cli) Update(in1 Input, in2 Input, channel string, output Output) {
-	originalConfig, updatedConfig := common.Config{}, common.Config{}
-
-	err := in1.Unmarshal(&originalConfig)
-	cli.FatalIfError(err, "Failed to read original config")
-	err = in2.Unmarshal(&updatedConfig)
-	cli.FatalIfError(err, "Failed to read updated config")
-
-	configUpdate, err := update.Compute(&originalConfig, &updatedConfig)
-	cli.FatalIfError(err, "Error computing config update")
-
-	configUpdate.ChannelId = channel
-
-	err = output.Marshal(configUpdate)
-	cli.FatalIfError(err, "Error sending output")
-}
-
 func (cli *Cli) Verify(input Input, output Output) {
 	config := common.Config{}
 	err := input.Unmarshal(&config)
@@ -278,14 +264,68 @@ func (cli *Cli) Verify(input Input, output Output) {
 	cli.FatalIfError(err, "Error sending output")
 }
 
+func (cli *Cli) Update(in1 Input, in2 Input, channel string, envelop bool, output Output) {
+	originalConfig, updatedConfig := common.Config{}, common.Config{}
+
+	err := in1.Unmarshal(&originalConfig)
+	cli.FatalIfError(err, "Failed to read original config")
+	err = in2.Unmarshal(&updatedConfig)
+	cli.FatalIfError(err, "Failed to read updated config")
+
+	configUpdate, err := update.Compute(&originalConfig, &updatedConfig)
+	cli.FatalIfError(err, "Error computing config update")
+
+	configUpdate.ChannelId = channel
+
+	// wrap Envelope
+	if envelop {
+		// inner envelope
+		configUpdateEnvelope := &common.ConfigUpdateEnvelope{}
+		configUpdateEnvelope.ConfigUpdate, err = proto.Marshal(configUpdate)
+		cli.FatalIfError(err, "Cannot marshal ConfigUpdate")
+
+		out := cli.wrapChannelEnvelope(configUpdateEnvelope, common.HeaderType_CONFIG_UPDATE, 0, channel, 0)
+		err = output.Marshal(out)
+	} else {
+		err = output.Marshal(configUpdate)
+	}
+	cli.FatalIfError(err, "Error sending output")
+}
+
+func (cli *Cli) wrapChannelEnvelope(pb proto.Message, headerType common.HeaderType, version int32, channel string, epoch uint64) *common.Envelope {
+
+	encoded, err := proto.Marshal(pb)
+
+	payloadChannelHeader := utils.MakeChannelHeader(headerType, version, channel, epoch)
+	payloadHeader := &common.Header{}
+	payloadHeader.ChannelHeader, err = proto.Marshal(payloadChannelHeader)
+	cli.FatalIfError(err, "Cannot marshal ChannelHeader")
+
+	payloadBytes, err := proto.Marshal(&common.Payload{
+		Header: payloadHeader,
+		Data:   encoded,
+	})
+	cli.FatalIfError(err, "Cannot marshal Payload")
+
+	return &common.Envelope{Payload: payloadBytes}
+}
+
+func (cli *Cli) unwrapChannelEnvelope(envelope *common.Envelope, pb proto.Message) {
+	payload := &common.Payload{}
+	err := proto.Unmarshal(envelope.Payload, payload)
+	cli.FatalIfError(err, "Cannot unmarshal Payload")
+	err = proto.Unmarshal(payload.Data, pb)
+	cli.FatalIfError(err, "Cannot unmarshal Payload.Data")
+	return
+}
+
 func (cli *Cli) Sign(input Input, output Output, channel string, mspID string, mspDir string) {
-	cu := &common.ConfigUpdate{}
-	err := input.Unmarshal(cu)
+	envelop := &common.Envelope{}
+	err := input.Unmarshal(envelop)
 	cli.FatalIfError(err, "Error reading input")
 
 	configUpdateEnvelope := &common.ConfigUpdateEnvelope{}
-	configUpdateEnvelope.ConfigUpdate, err = proto.Marshal(cu)
-	cli.FatalIfError(err, "Cannot marshal input to pb")
+	cli.unwrapChannelEnvelope(envelop, configUpdateEnvelope)
 
 	var signer crypto.LocalSigner
 	if mspDir != "" {
@@ -307,22 +347,7 @@ func (cli *Cli) Sign(input Input, output Output, channel string, mspID string, m
 		fmt.Fprintf(os.Stderr, "Envelope signed with %s\n", mspID)
 	}
 
-	encoded, err := proto.Marshal(configUpdateEnvelope)
-	cli.FatalIfError(err, "Cannot marshal ConfigUpdateEnvelope")
-
-	payloadChannelHeader := utils.MakeChannelHeader(common.HeaderType_CONFIG_UPDATE, 0, channel, 0)
-	payloadHeader := &common.Header{}
-	payloadHeader.ChannelHeader, err = proto.Marshal(payloadChannelHeader)
-	cli.FatalIfError(err, "Cannot marshal ChannelHeader")
-
-	payloadBytes, err := proto.Marshal(&common.Payload{
-		Header: payloadHeader,
-		Data:   encoded,
-	})
-	cli.FatalIfError(err, "Cannot marshal Payload")
-
-	envelope := &common.Envelope{Payload: payloadBytes}
-
-	err = output.Marshal(envelope)
+	out := cli.wrapChannelEnvelope(configUpdateEnvelope, common.HeaderType_CONFIG_UPDATE, 0, channel, 0)
+	err = output.Marshal(out)
 	cli.FatalIfError(err, "Error writing output Envelope")
 }
