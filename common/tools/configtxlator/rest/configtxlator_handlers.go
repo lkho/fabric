@@ -29,11 +29,7 @@ import (
 	"github.com/golang/protobuf/proto"
 	"github.com/hyperledger/fabric/common/configtx"
 	"github.com/hyperledger/fabric/protos/utils"
-	"github.com/hyperledger/fabric/msp/mgmt"
-	"github.com/hyperledger/fabric/bccsp/factory"
-	"github.com/hyperledger/fabric/common/localmsp"
-	"github.com/hyperledger/fabric/common/crypto"
-	"github.com/hyperledger/fabric/common/util"
+	"github.com/hyperledger/fabric/common/tools/configtxlator/sign"
 )
 
 func fieldBytes(fieldName string, r *http.Request) ([]byte, error) {
@@ -131,44 +127,6 @@ func SanityCheckConfig(w http.ResponseWriter, r *http.Request) {
 	w.Write(resBytes)
 }
 
-func signingConfigUpdateEnv(w http.ResponseWriter, r *http.Request, env *cb.ConfigUpdateEnvelope) ([]byte, error) {
-	mspID := r.FormValue("mspID")
-	mspDir := r.FormValue("mspDir")
-
-	var signer crypto.LocalSigner
-	if mspDir != "" {
-		mgmt.LoadLocalMsp(mspDir, factory.GetDefaultOpts(), mspID)
-		signer = localmsp.NewSigner()
-	} else {
-		signer = nil
-	}
-
-	if signer != nil {
-		sigHeader, err := signer.NewSignatureHeader()
-
-		if err != nil {
-			/*w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprintf(w, "Bad signer :%s\n", err)*/
-			return nil, err
-		}
-
-		configSig := &cb.ConfigSignature{
-			SignatureHeader: utils.MarshalOrPanic(sigHeader),
-		}
-
-		configSig.Signature, err = signer.Sign(util.ConcatenateBytes(configSig.SignatureHeader, env.ConfigUpdate))
-		if err != nil {
-			/*w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprintf(w, "Error signing config update: %s\n", err)*/
-			return nil, err
-		}
-
-		env.Signatures = append(env.Signatures, configSig)
-	}
-
-	return proto.Marshal(env)
-}
-
 func SignConfigUpdateEnvelope(w http.ResponseWriter, r *http.Request) {
 	env, err := fieldBytes("configUpdateEnvelope", r)
 	if err != nil {
@@ -184,7 +142,7 @@ func SignConfigUpdateEnvelope(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	encoded, err := signingConfigUpdateEnv(w, r, configUpdateEnvelope)
+	encoded, err := sign.SigningConfigUpdateEnv(w, r, configUpdateEnvelope)
 
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -232,7 +190,7 @@ func SignConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		ConfigUpdate: utils.MarshalOrPanic(configUpdate),
 	}
 
-	encoded, err := signingConfigUpdateEnv(w, r, configUpdateEnvelope)
+	encoded, err := sign.SigningConfigUpdateEnv(w, r, configUpdateEnvelope)
 
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)

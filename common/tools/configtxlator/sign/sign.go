@@ -6,12 +6,16 @@ import (
 	"github.com/hyperledger/fabric/common/localmsp"
 	cb "github.com/hyperledger/fabric/protos/common"
 	"github.com/hyperledger/fabric/common/crypto"
-	"fmt"
 	"github.com/hyperledger/fabric/protos/utils"
 	"github.com/hyperledger/fabric/common/util"
+	"net/http"
+	"github.com/golang/protobuf/proto"
 )
 
-func SignConfigUpdateEnvelope(mspID string, mspDir string, env *cb.ConfigUpdateEnvelope) error {
+func SigningConfigUpdateEnv(w http.ResponseWriter, r *http.Request, env *cb.ConfigUpdateEnvelope) ([]byte, error) {
+	mspID := r.FormValue("mspID")
+	mspDir := r.FormValue("mspDir")
+
 	var signer crypto.LocalSigner
 	if mspDir != "" {
 		mgmt.LoadLocalMsp(mspDir, factory.GetDefaultOpts(), mspID)
@@ -24,7 +28,9 @@ func SignConfigUpdateEnvelope(mspID string, mspDir string, env *cb.ConfigUpdateE
 		sigHeader, err := signer.NewSignatureHeader()
 
 		if err != nil {
-			return fmt.Errorf("Bad signer: %s", err)
+			/*w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, "Bad signer :%s\n", err)*/
+			return nil, err
 		}
 
 		configSig := &cb.ConfigSignature{
@@ -33,10 +39,13 @@ func SignConfigUpdateEnvelope(mspID string, mspDir string, env *cb.ConfigUpdateE
 
 		configSig.Signature, err = signer.Sign(util.ConcatenateBytes(configSig.SignatureHeader, env.ConfigUpdate))
 		if err != nil {
-			return fmt.Errorf("Error signing config update: %s", err)
+			/*w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, "Error signing config update: %s\n", err)*/
+			return nil, err
 		}
 
 		env.Signatures = append(env.Signatures, configSig)
 	}
-	return nil
+
+	return proto.Marshal(env)
 }
