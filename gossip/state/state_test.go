@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math/rand"
 	"strconv"
 	"sync"
 	"testing"
@@ -147,7 +148,7 @@ func bootPeers(ids ...int) []string {
 type peerNode struct {
 	port   int
 	g      gossip.Gossip
-	s      GossipStateProvider
+	s      *GossipStateProviderImpl
 	cs     *cryptoServiceMock
 	commit committer.Committer
 }
@@ -163,18 +164,32 @@ type mockCommitter struct {
 	sync.Mutex
 }
 
+func (mc *mockCommitter) CommitWithPvtData(blockAndPvtData *ledger.BlockAndPvtData) error {
+	args := mc.Called(blockAndPvtData)
+	return args.Error(0)
+}
+
+func (mc *mockCommitter) GetPvtDataAndBlockByNum(seqNum uint64) (*ledger.BlockAndPvtData, error) {
+	args := mc.Called(seqNum)
+	return args.Get(0).(*ledger.BlockAndPvtData), args.Error(1)
+}
+
 func (mc *mockCommitter) Commit(block *pcomm.Block) error {
-	mc.Called(block)
+	mc.Lock()
+	m := mc.Mock
+	mc.Unlock()
+	m.Called(block)
 	return nil
 }
 
 func (mc *mockCommitter) LedgerHeight() (uint64, error) {
 	mc.Lock()
-	defer mc.Unlock()
-	if mc.Called().Get(1) == nil {
-		return mc.Called().Get(0).(uint64), nil
+	m := mc.Mock
+	mc.Unlock()
+	if m.Called().Get(1) == nil {
+		return m.Called().Get(0).(uint64), nil
 	}
-	return mc.Called().Get(0).(uint64), mc.Called().Get(1).(error)
+	return m.Called().Get(0).(uint64), m.Called().Get(1).(error)
 }
 
 func (mc *mockCommitter) GetBlocks(blockSeqs []uint64) []*pcomm.Block {
@@ -246,7 +261,7 @@ func newPeerNodeWithGossip(config *gossip.Config, committer committer.Committer,
 	return &peerNode{
 		port:   config.BindPort,
 		g:      g,
-		s:      sp,
+		s:      sp.(*GossipStateProviderImpl),
 		commit: committer,
 		cs:     cs,
 	}
@@ -265,13 +280,13 @@ func TestNilDirectMsg(t *testing.T) {
 	g.On("Accept", mock.Anything, true).Return(nil, make(<-chan proto.ReceivedMessage))
 	p := newPeerNodeWithGossip(newGossipConfig(0), mc, noopPeerIdentityAcceptor, g)
 	defer p.shutdown()
-	p.s.(*GossipStateProviderImpl).handleStateRequest(nil)
-	p.s.(*GossipStateProviderImpl).directMessage(nil)
-	sMsg, _ := p.s.(*GossipStateProviderImpl).stateRequestMessage(uint64(10), uint64(8)).NoopSign()
+	p.s.handleStateRequest(nil)
+	p.s.directMessage(nil)
+	sMsg, _ := p.s.stateRequestMessage(uint64(10), uint64(8)).NoopSign()
 	req := &comm.ReceivedMessageImpl{
 		SignedGossipMessage: sMsg,
 	}
-	p.s.(*GossipStateProviderImpl).directMessage(req)
+	p.s.directMessage(req)
 }
 
 func TestNilAddPayload(t *testing.T) {
@@ -335,10 +350,10 @@ func TestOverPopulation(t *testing.T) {
 	for i := 1; i <= 4; i++ {
 		rawblock := pcomm.NewBlock(uint64(i), []byte{})
 		b, _ := pb.Marshal(rawblock)
-		assert.NoError(t, p.s.AddPayload(&proto.Payload{
+		assert.NoError(t, p.s.addPayload(&proto.Payload{
 			SeqNum: uint64(i),
 			Data:   b,
-		}))
+		}, nonBlocking))
 	}
 
 	// Add payloads from 10 to defMaxBlockDistance, while we're missing blocks [5,9]
@@ -346,10 +361,10 @@ func TestOverPopulation(t *testing.T) {
 	for i := 10; i <= defMaxBlockDistance; i++ {
 		rawblock := pcomm.NewBlock(uint64(i), []byte{})
 		b, _ := pb.Marshal(rawblock)
-		assert.NoError(t, p.s.AddPayload(&proto.Payload{
+		assert.NoError(t, p.s.addPayload(&proto.Payload{
 			SeqNum: uint64(i),
 			Data:   b,
-		}))
+		}, nonBlocking))
 	}
 
 	// Add payloads from defMaxBlockDistance + 2 to defMaxBlockDistance * 10
@@ -357,10 +372,10 @@ func TestOverPopulation(t *testing.T) {
 	for i := defMaxBlockDistance + 1; i <= defMaxBlockDistance*10; i++ {
 		rawblock := pcomm.NewBlock(uint64(i), []byte{})
 		b, _ := pb.Marshal(rawblock)
-		assert.Error(t, p.s.AddPayload(&proto.Payload{
+		assert.Error(t, p.s.addPayload(&proto.Payload{
 			SeqNum: uint64(i),
 			Data:   b,
-		}))
+		}, nonBlocking))
 	}
 
 	// Ensure only blocks 1-4 were passed to the ledger
@@ -373,9 +388,76 @@ func TestOverPopulation(t *testing.T) {
 	assert.Equal(t, 5, i)
 
 	// Ensure we don't store too many blocks in memory
-	sp := p.s.(*GossipStateProviderImpl)
+	sp := p.s
 	assert.True(t, sp.payloads.Size() < defMaxBlockDistance)
+}
 
+func TestBlockingEnqueue(t *testing.T) {
+	// Scenario: In parallel, get blocks from gossip and from the orderer.
+	// The blocks from the orderer we get are X2 times the amount of blocks from gossip.
+	// The blocks we get from gossip are random indices, to maximize disruption.
+	mc := &mockCommitter{}
+	blocksPassedToLedger := make(chan uint64, 10)
+	mc.On("Commit", mock.Anything).Run(func(arg mock.Arguments) {
+		blocksPassedToLedger <- arg.Get(0).(*pcomm.Block).Header.Number
+	})
+	mc.On("LedgerHeight", mock.Anything).Return(uint64(1), nil)
+	g := &mocks.GossipMock{}
+	g.On("Accept", mock.Anything, false).Return(make(<-chan *proto.GossipMessage), nil)
+	g.On("Accept", mock.Anything, true).Return(nil, make(<-chan proto.ReceivedMessage))
+	p := newPeerNode(newGossipConfig(0), mc, noopPeerIdentityAcceptor)
+	defer p.shutdown()
+
+	numBlocksReceived := 500
+	receivedBlockCount := 0
+	// Get a block from the orderer every 1ms
+	go func() {
+		for i := 1; i <= numBlocksReceived; i++ {
+			rawblock := pcomm.NewBlock(uint64(i), []byte{})
+			b, _ := pb.Marshal(rawblock)
+			block := &proto.Payload{
+				SeqNum: uint64(i),
+				Data:   b,
+			}
+			p.s.AddPayload(block)
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	// Get a block from gossip every 1ms too
+	go func() {
+		rand.Seed(time.Now().UnixNano())
+		for i := 1; i <= numBlocksReceived/2; i++ {
+			blockSeq := rand.Intn(numBlocksReceived)
+			rawblock := pcomm.NewBlock(uint64(blockSeq), []byte{})
+			b, _ := pb.Marshal(rawblock)
+			block := &proto.Payload{
+				SeqNum: uint64(blockSeq),
+				Data:   b,
+			}
+			p.s.addPayload(block, nonBlocking)
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	for {
+		receivedBlock := <-blocksPassedToLedger
+		receivedBlockCount++
+		m := mock.Mock{}
+		m.On("LedgerHeight", mock.Anything).Return(receivedBlock, nil)
+		m.On("Commit", mock.Anything).Run(func(arg mock.Arguments) {
+			blocksPassedToLedger <- arg.Get(0).(*pcomm.Block).Header.Number
+		})
+		mc.Lock()
+		mc.Mock = m
+		mc.Unlock()
+		assert.Equal(t, receivedBlock, uint64(receivedBlockCount))
+		if int(receivedBlockCount) == numBlocksReceived {
+			break
+		}
+		time.Sleep(time.Millisecond * 10)
+		t.Log("got block", receivedBlock)
+	}
 }
 
 func TestFailures(t *testing.T) {
@@ -878,7 +960,7 @@ type coordinatorMock struct {
 	mock.Mock
 }
 
-func (mock *coordinatorMock) GetPvtDataAndBlockByNum(seqNum uint64, filter PvtDataFilter) (*pcomm.Block, PvtDataCollections, error) {
+func (mock *coordinatorMock) GetPvtDataAndBlockByNum(seqNum uint64) (*pcomm.Block, PvtDataCollections, error) {
 	args := mock.Called(seqNum)
 	return args.Get(0).(*pcomm.Block), args.Get(1).(PvtDataCollections), args.Error(2)
 }
@@ -888,7 +970,7 @@ func (mock *coordinatorMock) GetBlockByNum(seqNum uint64) (*pcomm.Block, error) 
 	return args.Get(0).(*pcomm.Block), args.Error(1)
 }
 
-func (mock *coordinatorMock) StoreBlock(block *pcomm.Block, data ...PvtDataCollections) ([]string, error) {
+func (mock *coordinatorMock) StoreBlock(block *pcomm.Block, data PvtDataCollections) ([]string, error) {
 	args := mock.Called(block, data)
 	return args.Get(0).([]string), args.Error(1)
 }
@@ -971,18 +1053,16 @@ func TestTransferOfPrivateRWSet(t *testing.T) {
 			},
 			pvtData: PvtDataCollections{
 				{
-					Payload: &ledger.TxPvtData{
-						SeqInBlock: uint64(0),
-						WriteSet: &rwset.TxPvtReadWriteSet{
-							DataModel: rwset.TxReadWriteSet_KV,
-							NsPvtRwset: []*rwset.NsPvtReadWriteSet{
-								{
-									Namespace: "myCC:v1",
-									CollectionPvtRwset: []*rwset.CollectionPvtReadWriteSet{
-										{
-											CollectionName: "mysecrectCollection",
-											Rwset:          []byte{1, 2, 3, 4, 5},
-										},
+					SeqInBlock: uint64(0),
+					WriteSet: &rwset.TxPvtReadWriteSet{
+						DataModel: rwset.TxReadWriteSet_KV,
+						NsPvtRwset: []*rwset.NsPvtReadWriteSet{
+							{
+								Namespace: "myCC:v1",
+								CollectionPvtRwset: []*rwset.CollectionPvtReadWriteSet{
+									{
+										CollectionName: "mysecrectCollection",
+										Rwset:          []byte{1, 2, 3, 4, 5},
 									},
 								},
 							},
@@ -1005,18 +1085,16 @@ func TestTransferOfPrivateRWSet(t *testing.T) {
 			},
 			pvtData: PvtDataCollections{
 				{
-					Payload: &ledger.TxPvtData{
-						SeqInBlock: uint64(2),
-						WriteSet: &rwset.TxPvtReadWriteSet{
-							DataModel: rwset.TxReadWriteSet_KV,
-							NsPvtRwset: []*rwset.NsPvtReadWriteSet{
-								{
-									Namespace: "otherCC:v1",
-									CollectionPvtRwset: []*rwset.CollectionPvtReadWriteSet{
-										{
-											CollectionName: "topClassified",
-											Rwset:          []byte{0, 0, 0, 4, 2},
-										},
+					SeqInBlock: uint64(2),
+					WriteSet: &rwset.TxPvtReadWriteSet{
+						DataModel: rwset.TxReadWriteSet_KV,
+						NsPvtRwset: []*rwset.NsPvtReadWriteSet{
+							{
+								Namespace: "otherCC:v1",
+								CollectionPvtRwset: []*rwset.CollectionPvtReadWriteSet{
+									{
+										CollectionName: "topClassified",
+										Rwset:          []byte{0, 0, 0, 4, 2},
 									},
 								},
 							},
@@ -1113,7 +1191,7 @@ func TestTransferOfPrivateRWSet(t *testing.T) {
 			pvtRWSet := &rwset.TxPvtReadWriteSet{}
 			err = pb.Unmarshal(pvtDataPayload.Payload, pvtRWSet)
 			assertion.NoError(err)
-			assertion.Equal(p.Payload.WriteSet, pvtRWSet)
+			assertion.Equal(p.WriteSet, pvtRWSet)
 		}
 	}
 }
@@ -1198,19 +1276,17 @@ func TestTransferOfPvtDataBetweenPeers(t *testing.T) {
 		Data: &pcomm.BlockData{
 			Data: [][]byte{{4}, {5}, {6}},
 		},
-	}, PvtDataCollections{&PvtData{
-		Payload: &ledger.TxPvtData{
-			SeqInBlock: uint64(1),
-			WriteSet: &rwset.TxPvtReadWriteSet{
-				DataModel: rwset.TxReadWriteSet_KV,
-				NsPvtRwset: []*rwset.NsPvtReadWriteSet{
-					{
-						Namespace: "myCC:v1",
-						CollectionPvtRwset: []*rwset.CollectionPvtReadWriteSet{
-							{
-								CollectionName: "mysecrectCollection",
-								Rwset:          []byte{1, 2, 3, 4, 5},
-							},
+	}, PvtDataCollections{&ledger.TxPvtData{
+		SeqInBlock: uint64(1),
+		WriteSet: &rwset.TxPvtReadWriteSet{
+			DataModel: rwset.TxReadWriteSet_KV,
+			NsPvtRwset: []*rwset.NsPvtReadWriteSet{
+				{
+					Namespace: "myCC:v1",
+					CollectionPvtRwset: []*rwset.CollectionPvtReadWriteSet{
+						{
+							CollectionName: "mysecrectCollection",
+							Rwset:          []byte{1, 2, 3, 4, 5},
 						},
 					},
 				},
@@ -1219,7 +1295,7 @@ func TestTransferOfPvtDataBetweenPeers(t *testing.T) {
 	}}, nil)
 
 	// Return membership of the peers
-	metastate := &NodeMetastate{LedgerHeight: uint64(2)}
+	metastate := &common.NodeMetastate{LedgerHeight: uint64(2)}
 	metaBytes, err := metastate.Bytes()
 	assert.NoError(t, err)
 	member2 := discovery.NetworkMember{
@@ -1229,7 +1305,7 @@ func TestTransferOfPvtDataBetweenPeers(t *testing.T) {
 		Metadata:         metaBytes,
 	}
 
-	metastate = &NodeMetastate{LedgerHeight: uint64(3)}
+	metastate = &common.NodeMetastate{LedgerHeight: uint64(3)}
 	metaBytes, err = metastate.Bytes()
 	assert.NoError(t, err)
 	member1 := discovery.NetworkMember{

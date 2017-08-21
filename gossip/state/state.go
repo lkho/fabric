@@ -24,6 +24,7 @@ import (
 	"github.com/hyperledger/fabric/protos/common"
 	proto "github.com/hyperledger/fabric/protos/gossip"
 	"github.com/op/go-logging"
+	"github.com/spf13/viper"
 )
 
 // GossipStateProvider is the interface to acquire sequences of the ledger blocks
@@ -48,6 +49,11 @@ const (
 	defAntiEntropyMaxRetries = 3
 
 	defMaxBlockDistance = 100
+
+	blocking    = true
+	nonBlocking = false
+
+	enqueueRetryInterval = time.Millisecond * 100
 )
 
 // GossipAdapter defines gossip/communication required interface for state provider
@@ -209,7 +215,7 @@ func NewGossipCoordinatedStateProvider(chainID string, services *ServicesMediato
 		once: sync.Once{},
 	}
 
-	nodeMetastate := NewNodeMetastate(height - 1)
+	nodeMetastate := common2.NewNodeMetastate(height - 1)
 
 	logger.Infof("Updating node metadata information, "+
 		"current ledger sequence is at = %d, next expected block is = %d", nodeMetastate.LedgerHeight, s.payloads.Next())
@@ -343,7 +349,7 @@ func (s *GossipStateProviderImpl) handleStateRequest(msg proto.ReceivedMessage) 
 	response := &proto.RemoteStateResponse{Payloads: make([]*proto.Payload, 0)}
 	for seqNum := request.StartSeqNum; seqNum <= endSeqNum; seqNum++ {
 		logger.Debug("Reading block ", seqNum, " with private data from the coordinator service")
-		block, pvtData, err := s.coordinator.GetPvtDataAndBlockByNum(seqNum, nil)
+		block, pvtData, err := s.coordinator.GetPvtDataAndBlockByNum(seqNum)
 
 		if err != nil {
 			logger.Errorf("Wasn't able to read block with sequence number %d from ledger, "+
@@ -365,10 +371,6 @@ func (s *GossipStateProviderImpl) handleStateRequest(msg proto.ReceivedMessage) 
 
 		var pvtBytes [][]byte
 		if pvtData != nil {
-			// TODO: Need to extract orgID of the requester and filter out
-			// private data entries which doesn't belongs to collections
-			// allowed for sender organization based on policies
-
 			// Marshal private data
 			pvtBytes, err = pvtData.Marshal()
 			if err != nil {
@@ -445,7 +447,7 @@ func (s *GossipStateProviderImpl) queueNewMessage(msg *proto.GossipMessage) {
 
 	dataMsg := msg.GetDataMsg()
 	if dataMsg != nil {
-		if err := s.AddPayload(dataMsg.GetPayload()); err != nil {
+		if err := s.addPayload(dataMsg.GetPayload(), nonBlocking); err != nil {
 			logger.Warning("Failed adding payload:", err)
 			return
 		}
@@ -478,15 +480,16 @@ func (s *GossipStateProviderImpl) deliverPayloads() {
 				logger.Debug("New block with claimed sequence number ", payload.SeqNum, " transactions num ", len(rawBlock.Data.Data))
 
 				// Read all private data into slice
-				pvt := make([]*PvtData, 0)
 				var p PvtDataCollections
-				err := p.Unmarshal(payload.PrivateData)
-				if err != nil {
-					logger.Errorf("Wasn't able to unmarshal private data for block seqNum = %d due to (%s)...dropping block", payload.SeqNum, err)
-					continue
+				if payload.PrivateData != nil {
+					err := p.Unmarshal(payload.PrivateData)
+					if err != nil {
+						logger.Errorf("Wasn't able to unmarshal private data for block seqNum = %d due to (%s)...dropping block", payload.SeqNum, err)
+						continue
+					}
 				}
 
-				if err := s.commitBlock(rawBlock, pvt); err != nil {
+				if err := s.commitBlock(rawBlock, p); err != nil {
 					logger.Panicf("Cannot commit block to the ledger due to %s", err)
 				}
 			}
@@ -534,7 +537,7 @@ func (s *GossipStateProviderImpl) antiEntropy() {
 func (s *GossipStateProviderImpl) maxAvailableLedgerHeight() uint64 {
 	max := uint64(0)
 	for _, p := range s.mediator.PeersOfChannel(common2.ChainID(s.chainID)) {
-		if nodeMetastate, err := FromBytes(p.Metadata); err == nil {
+		if nodeMetastate, err := common2.FromBytes(p.Metadata); err == nil {
 			if max < nodeMetastate.LedgerHeight {
 				max = nodeMetastate.LedgerHeight
 			}
@@ -647,7 +650,7 @@ func (s *GossipStateProviderImpl) filterPeers(predicate func(peer discovery.Netw
 // by provided input parameter
 func (s *GossipStateProviderImpl) hasRequiredHeight(height uint64) func(peer discovery.NetworkMember) bool {
 	return func(peer discovery.NetworkMember) bool {
-		if nodeMetadata, err := FromBytes(peer.Metadata); err != nil {
+		if nodeMetadata, err := common2.FromBytes(peer.Metadata); err != nil {
 			logger.Errorf("Unable to de-serialize node meta state, error = %s", err)
 		} else if nodeMetadata.LedgerHeight >= height {
 			return true
@@ -668,8 +671,20 @@ func (s *GossipStateProviderImpl) GetBlock(index uint64) *common.Block {
 	return nil
 }
 
-// AddPayload add new payload into state
+// AddPayload add new payload into state.
 func (s *GossipStateProviderImpl) AddPayload(payload *proto.Payload) error {
+	blockingMode := blocking
+	if viper.GetBool("peer.gossip.nonBlockingCommitMode") {
+		blockingMode = false
+	}
+	return s.addPayload(payload, blockingMode)
+}
+
+// addPayload add new payload into state. It may (or may not) block according to the
+// given parameter. If it gets a block while in blocking mode - it would wait until
+// the block is sent into the payloads buffer.
+// Else - it may drop the block, if the payload buffer is too full.
+func (s *GossipStateProviderImpl) addPayload(payload *proto.Payload, blockingMode bool) error {
 	if payload == nil {
 		return errors.New("Given payload is nil")
 	}
@@ -679,14 +694,18 @@ func (s *GossipStateProviderImpl) AddPayload(payload *proto.Payload) error {
 		return fmt.Errorf("Failed obtaining ledger height: %v", err)
 	}
 
-	if payload.SeqNum-height >= defMaxBlockDistance {
+	if !blockingMode && payload.SeqNum-height >= defMaxBlockDistance {
 		return fmt.Errorf("Ledger height is at %d, cannot enqueue block with sequence of %d", height, payload.SeqNum)
+	}
+
+	for blockingMode && s.payloads.Size() > defMaxBlockDistance*2 {
+		time.Sleep(enqueueRetryInterval)
 	}
 
 	return s.payloads.Push(payload)
 }
 
-func (s *GossipStateProviderImpl) commitBlock(block *common.Block, pvtData []*PvtData) error {
+func (s *GossipStateProviderImpl) commitBlock(block *common.Block, pvtData PvtDataCollections) error {
 
 	// Commit block with available private transactions
 	if _, err := s.coordinator.StoreBlock(block, pvtData); err != nil {
@@ -695,7 +714,7 @@ func (s *GossipStateProviderImpl) commitBlock(block *common.Block, pvtData []*Pv
 	}
 
 	// Update ledger level within node metadata
-	nodeMetastate := NewNodeMetastate(block.Header.Number)
+	nodeMetastate := common2.NewNodeMetastate(block.Header.Number)
 	// Decode nodeMetastate to byte array
 	b, err := nodeMetastate.Bytes()
 	if err == nil {
