@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"path"
 	"gopkg.in/alecthomas/kingpin.v2"
+	"encoding/base64"
 )
 
 type Cli struct {
@@ -18,12 +19,14 @@ type Cli struct {
 	encodeCmd *kingpin.CmdClause
 	encodeMsg *string
 	fIn       **os.File
+	fIn64     *bool
 	fInJson   *bool
 	fOut      *string
 	fOutJson  *bool
 
 	updateCmd     *kingpin.CmdClause
 	fIn2          **os.File
+	fIn264        *bool
 	fIn2Json      *bool
 	updateChannel *string
 	updateEnv     *bool
@@ -43,14 +46,17 @@ func NewCli(app *kingpin.Application) (cli *Cli) {
 	cli.encodeCmd = app.Command("encode", "encode/decode between protobuf/json format")
 	cli.encodeMsg = cli.encodeCmd.Flag("msg", "message name e.g. common.Block").Short('m').Required().String()
 	cli.fIn = cli.encodeCmd.Flag("in", "input file. Read from STDIN if not specified.").Short('i').File()
+	cli.fIn64 = cli.encodeCmd.Flag("i64", "use base64 to decode input first").Bool()
 	cli.fInJson = cli.encodeCmd.Flag("ij", "use json format instead of protobuf").Bool()
 	cli.fOut = cli.encodeCmd.Flag("out", "output file. Write to STDOUT if not specified.").Short('o').String()
 	cli.fOutJson = cli.encodeCmd.Flag("oj", "use json format instead of protobuf").Bool()
 
 	cli.updateCmd = app.Command("update", "compute update from configs")
 	cli.updateCmd.Flag("original", "original Config").Short('1').FileVar(cli.fIn)
+	cli.updateCmd.Flag("164", "use base64 to decode input first").BoolVar(cli.fIn64)
 	cli.updateCmd.Flag("1j", "use json format instead of protobuf").BoolVar(cli.fInJson)
 	cli.fIn2 = cli.updateCmd.Flag("updated", "updated Config").Short('2').File()
+	cli.fIn264 = cli.updateCmd.Flag("264", "use base64 to decode input first").Bool()
 	cli.fIn2Json = cli.updateCmd.Flag("2j", "use json format instead of protobuf").Bool()
 	cli.updateChannel = cli.updateCmd.Flag("channel", "Channel ID").Required().Short('c').String()
 	cli.updateEnv = cli.updateCmd.Flag("envelope", "output ConfigUpdate wrapped in Envelope").Short('e').Bool()
@@ -59,11 +65,13 @@ func NewCli(app *kingpin.Application) (cli *Cli) {
 
 	cli.verifyCmd = app.Command("verify", "Sanity check Config")
 	cli.verifyCmd.Flag("in", "input Config. Read from STDIN if not specified.").Short('i').FileVar(cli.fIn)
+	cli.verifyCmd.Flag("i64", "use base64 to decode input first").BoolVar(cli.fIn64)
 	cli.verifyCmd.Flag("ij", "use json format instead of protobuf").BoolVar(cli.fInJson)
 	cli.verifyCmd.Flag("out", "output json file. Write to STDOUT if not specified.").Short('o').StringVar(cli.fOut)
 
 	cli.signCmd = app.Command("sign-config-update", "sign a ConfigUpdate Envelope. Signatures will be appended").Alias("sc")
 	cli.signCmd.Flag("in", "input Envelope file. Read from STDIN if not specified.").Short('i').FileVar(cli.fIn)
+	cli.signCmd.Flag("i64", "use base64 to decode input first").BoolVar(cli.fIn64)
 	cli.signCmd.Flag("ij", "use json format instead of protobuf").BoolVar(cli.fInJson)
 	cli.signChannel = cli.signCmd.Flag("channel", "Channel ID").Required().Short('c').String()
 	cli.signMspId = cli.signCmd.Flag("mspid", "MSP ID used to sign").Required().String()
@@ -100,25 +108,25 @@ func (cli *Cli) Run(command string) {
 	case cli.encodeCmd.FullCommand():
 		cli.Encode(
 			*cli.encodeMsg,
-			Input{Stdin: true, File: *cli.fIn, Json: *cli.fInJson},
+			Input{Stdin: true, File: *cli.fIn, Json: *cli.fInJson, Base64: *cli.fIn64},
 			Output{Stdout: true, File: cli.fOut, Json: *cli.fOutJson})
 
 	case cli.updateCmd.FullCommand():
 		cli.Update(
-			Input{Stdin: false, File: *cli.fIn, Json: *cli.fInJson},
-			Input{Stdin: false, File: *cli.fIn2, Json: *cli.fIn2Json},
+			Input{Stdin: false, File: *cli.fIn, Json: *cli.fInJson, Base64: *cli.fIn64},
+			Input{Stdin: false, File: *cli.fIn2, Json: *cli.fIn2Json, Base64: *cli.fIn264},
 			*cli.updateChannel,
 			*cli.updateEnv,
 			Output{Stdout: true, File: cli.fOut, Json: *cli.fOutJson})
 
 	case cli.verifyCmd.FullCommand():
 		cli.Verify(
-			Input{Stdin: true, File: *cli.fIn, Json: *cli.fInJson},
+			Input{Stdin: true, File: *cli.fIn, Json: *cli.fInJson, Base64: *cli.fIn64},
 			Output{Stdout: true, File: cli.fOut, Json: true})
 
 	case cli.signCmd.FullCommand():
 		cli.Sign(
-			Input{Stdin: true, File: *cli.fIn, Json: *cli.fInJson},
+			Input{Stdin: true, File: *cli.fIn, Json: *cli.fInJson, Base64: *cli.fIn64},
 			Output{Stdout: true, File: cli.fOut, Json: *cli.fOutJson},
 			*cli.signChannel,
 			*cli.signMspId,
@@ -127,12 +135,13 @@ func (cli *Cli) Run(command string) {
 }
 
 type Input struct {
-	File  *os.File
-	Json  bool
-	Stdin bool
+	File   *os.File
+	Json   bool
+	Base64 bool
+	Stdin  bool
 }
 
-func (in *Input) GetStream() *os.File {
+func (in *Input) GetInput() *os.File {
 	if in.File != nil {
 		return in.File
 	} else if in.Stdin {
@@ -141,13 +150,25 @@ func (in *Input) GetStream() *os.File {
 	return nil
 }
 
-func (in *Input) Unmarshal(pb proto.Message) error {
-	s := in.GetStream()
+func (in *Input) GetReader() (io.Reader, error) {
+	s := in.GetInput()
 	if s == nil {
-		return Errorf("No input specified")
+		return nil, Errorf("No input specified")
+	}
+	if in.Base64 {
+		return base64.NewDecoder(base64.StdEncoding, in.GetInput()), nil
+	} else {
+		return in.GetInput(), nil
+	}
+}
+
+func (in *Input) Unmarshal(pb proto.Message) error {
+	r, err := in.GetReader()
+	if err != nil {
+		return err
 	}
 	if !in.Json {
-		buf, err := ioutil.ReadAll(s)
+		buf, err := ioutil.ReadAll(r)
 		if err != nil {
 			return Errorf("Cannot read File: %s", err)
 		}
@@ -156,7 +177,7 @@ func (in *Input) Unmarshal(pb proto.Message) error {
 			return Errorf("Cannot unmarshal pb: %s", err)
 		}
 	} else {
-		err := protolator.DeepUnmarshalJSON(s, pb)
+		err := protolator.DeepUnmarshalJSON(r, pb)
 		if err != nil {
 			return Errorf("Cannot unmarshal Json: %s", err)
 		}
