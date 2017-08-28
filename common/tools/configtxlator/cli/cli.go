@@ -170,7 +170,11 @@ func (in *Input) Unmarshal(pb proto.Message) error {
 	if !in.Json {
 		buf, err := ioutil.ReadAll(r)
 		if err != nil {
-			return Errorf("Cannot read File: %s", err)
+			if in.Base64 {
+				return Errorf("Cannot read base64 input stream: %s", err)
+			} else {
+				return Errorf("Cannot read input stream: %s", err)
+			}
 		}
 		err = proto.Unmarshal(buf, pb)
 		if err != nil {
